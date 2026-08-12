@@ -1,7 +1,1040 @@
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <stdexcept>
+#include <type_traits>
 #include <vector>
+
 #include <common/maca_fp16.h>
 
 #include "../tester/utils.h"
+
+// -----------------------------------------------------------------------------
+// 调优常量
+// -----------------------------------------------------------------------------
+
+// 单个查询使用的协作线程数。正确性不依赖硬件 wavefront 宽度，但性能会受其影响；
+// 默认使用 MACA wavefront 宽度，也可以通过 -DMACA_GROUP_SIZE=32 覆盖。
+#ifndef MACA_GROUP_SIZE
+#define MACA_GROUP_SIZE 64
+#endif
+
+// 每个 block 处理的 Q 头组数；增大它可以提高 GQA 中 K/V 复用，但会占用更多共享内存。
+#ifndef MACA_GROUPS_PER_BLOCK
+#define MACA_GROUPS_PER_BLOCK 4
+#endif
+
+// 两次 block 屏障之间处理的 K/V 行数。
+#ifndef MACA_K_TILE
+#define MACA_K_TILE 8
+#endif
+
+static_assert(MACA_GROUP_SIZE * MACA_GROUPS_PER_BLOCK <= 1024,
+              "block size exceeds the maximum threads per block");
+static_assert(MACA_GROUP_SIZE >= MACA_K_TILE,
+              "the score reduction assigns one lane per tile row");
+
+constexpr size_t MACA_KV_TILED_MIN_QUERIES = 16384;
+constexpr int MACA_HALF_KV_TILED_MIN_SEQUENCE = 64;
+constexpr int MACA_FLOAT_KV_TILED_MIN_SEQUENCE = 128;
+constexpr int MACA_KV_TILE_ROWS = 64;
+constexpr int MACA_FLOAT_HEAD64_KV_TILE_ROWS = 32;
+constexpr int MACA_SCORE_TILE_ROWS = 8;
+
+// -----------------------------------------------------------------------------
+// 标量类型转换：无论存储类型为何，Kernel 内部统一使用 FP32 累加。
+// -----------------------------------------------------------------------------
+/**
+ * @brief 将类型 T 转换为 float，供 Kernel 使用 FP32 计算
+ * @tparam T 输入数据类型
+ * @param x 待转换的数据
+ * @return 转换后的 float 数据
+ */
+template <typename T>
+__host__ __device__ __forceinline__ float toFloat(T x) {
+  return static_cast<float>(x);
+}
+
+/**
+ * @brief 将 half 类型转换为 float
+ * @param x 待转换的 half 数据
+ * @return 转换后的 float 数据
+ */
+template <>
+__host__ __device__ __forceinline__ float toFloat<half>(half x) {
+  return __half2float(x);
+}
+
+/**
+ * @brief 将 FP32 计算结果转换回存储类型 T
+ * @tparam T 输出数据类型
+ * @param x 待转换的 float 数据
+ * @return 类型为 T 的转换结果
+ */
+template <typename T>
+__host__ __device__ __forceinline__ T fromFloat(float x) {
+  return static_cast<T>(x);
+}
+
+/**
+ * @brief 将 float 类型转换为 half
+ * @param x 待转换的 float 数据
+ * @return 转换后的 half 数据
+ */
+template <>
+__host__ __device__ __forceinline__ half fromFloat<half>(float x) {
+  return __float2half(x);
+}
+
+// -----------------------------------------------------------------------------
+// 可复用设备缓冲区：保留显存并只在容量不足时扩容，减少 mcMalloc/mcFree 开销。
+// -----------------------------------------------------------------------------
+/**
+ * @brief 管理一块可复用的 MACA 设备内存
+ * @tparam T 缓冲区元素类型
+ */
+template <typename T>
+class ReusableDeviceBuffer {
+ public:
+  ReusableDeviceBuffer() = default;
+  ReusableDeviceBuffer(const ReusableDeviceBuffer&) = delete;
+  ReusableDeviceBuffer& operator=(const ReusableDeviceBuffer&) = delete;
+
+  ~ReusableDeviceBuffer() {
+    if (ptr_ != nullptr) {
+      // 析构阶段设备上下文可能已经销毁，因此这里只尝试释放，不检查或抛出错误。
+      mcFree(ptr_);
+    }
+  }
+
+  /**
+   * @brief 确保缓冲区能够容纳指定数量的元素
+   * @param count 所需元素数量
+   */
+  void ensure(size_t count) {
+    // 容量足够时直接复用，否则释放旧内存并重新分配更大空间。
+    if (count <= capacity_) {
+      return;
+    }
+    if (ptr_ != nullptr) {
+      RUNTIME_CHECK(mcFree(ptr_));
+      ptr_ = nullptr;
+      capacity_ = 0;
+    }
+    // mcMalloc 的参数是字节数，因此将元素数量乘以 sizeof(T)。
+    RUNTIME_CHECK(mcMalloc(reinterpret_cast<void**>(&ptr_), count * sizeof(T)));
+    capacity_ = count;
+  }
+
+  T* data() { return ptr_; }
+  const T* data() const { return ptr_; }
+  size_t capacity() const { return capacity_; }
+
+ private:
+  T* ptr_ = nullptr;
+  size_t capacity_ = 0;
+};
+
+// -----------------------------------------------------------------------------
+// RMSNorm
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief 使用一个 block 处理一行的 RMSNorm Kernel
+ * @tparam T 输入、权重和输出的数据类型
+ * @param input GPU 输入张量地址
+ * @param weight GPU 权重向量地址
+ * @param output GPU 输出张量地址
+ * @param rows 输入行数
+ * @param hidden_dim 每行元素数量
+ * @param eps 防止除零的稳定项
+ */
+template <typename T>
+__global__ void rmsNormKernel(const T* __restrict__ input,
+                              const T* __restrict__ weight,
+                              T* __restrict__ output, size_t rows,
+                              size_t hidden_dim, float eps) {
+  // blockIdx.x 直接表示输入行号，一个 block 从头到尾只处理这一行。
+  const size_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  // 每个线程计算部分平方和，并将其存入共享内存准备树形归约。
+  extern __shared__ float shm[];
+  float local_sum = 0.0f;
+
+  // 线程以 blockDim.x 为步长遍历列，hidden_dim 大于线程数时也能覆盖整行。
+  for (size_t col = threadIdx.x; col < hidden_dim; col += blockDim.x) {
+    const float x = toFloat(input[row * hidden_dim + col]);
+    local_sum += x * x;
+  }
+
+  shm[threadIdx.x] = local_sum;
+  // 确保所有局部平方和都已写入，才能开始读取其他线程的归约槽位。
+  __syncthreads();
+
+  // blockDim.x 由 Host 保证为 2 的幂，逐轮将后一半结果归约到前一半。
+  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shm[threadIdx.x] += shm[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    // shm[0] 已是整行平方和；除以 hidden_dim 得到均方值。
+    const float mean_square = shm[0] / static_cast<float>(hidden_dim);
+    // MACA 数学头文件不保证提供 rsqrtf，因此显式计算 1/sqrt。
+    shm[0] = 1.0f / sqrtf(mean_square + eps);
+  }
+  __syncthreads();
+
+  // 所有线程读取同一个逆 RMS，并行完成归一化和逐列权重缩放。
+  const float inv_rms = shm[0];
+  for (size_t col = threadIdx.x; col < hidden_dim; col += blockDim.x) {
+    const size_t idx = row * hidden_dim + col;
+    const float x = toFloat(input[idx]);
+    const float w = toFloat(weight[col]);
+    output[idx] = fromFloat<T>(x * inv_rms * w);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// FlashAttention
+// -----------------------------------------------------------------------------
+
+// “尚未读取分数”的哨兵值。使用有限大负数避免首次缩放出现 exp(-inf+inf)=NaN。
+#define FA_NEG_SENTINEL (-1.0e30f)
+
+/**
+ * @brief 使用线程组和在线 Softmax 计算 FlashAttention
+ * @tparam T 输入和输出张量的数据类型
+ * @tparam GROUP_SIZE 每个查询使用的线程数
+ * @tparam GROUPS_PER_BLOCK 每个 block 处理的查询组数
+ * @tparam MAX_HEAD_DIM Kernel 支持的最大头维度
+ * @tparam TILE 每轮处理的 K/V 行数
+ * @param q GPU 查询张量地址
+ * @param k GPU 键张量地址
+ * @param v GPU 值张量地址
+ * @param o GPU 输出张量地址
+ * @param target_seq_len Q 的序列长度
+ * @param src_seq_len K/V 的序列长度
+ * @param query_heads Q 的注意力头数量
+ * @param kv_heads K/V 的注意力头数量
+ * @param head_dim 每个注意力头的维度
+ * @param is_causal 是否使用因果掩码
+ */
+template <typename T, int GROUP_SIZE, int GROUPS_PER_BLOCK, int MAX_HEAD_DIM,
+          int TILE>
+__global__ void flashAttentionGroupKernel(
+    const T* __restrict__ q, const T* __restrict__ k, const T* __restrict__ v,
+    T* __restrict__ o, int target_seq_len, int src_seq_len, int query_heads,
+    int kv_heads, int head_dim, bool is_causal) {
+  constexpr int ITEMS_PER_LANE = (MAX_HEAD_DIM + GROUP_SIZE - 1) / GROUP_SIZE;
+
+  // 保存 [线程组][tile 行][lane] 的局部点积；末维多一个元素以降低 bank 冲突。
+  __shared__ float s_part[GROUPS_PER_BLOCK][TILE][GROUP_SIZE + 1];
+  __shared__ float s_score[GROUPS_PER_BLOCK][TILE];
+
+  // 三维网格映射 batch、目标位置和 Q 头组，组内 lane 分担 head_dim 分量。
+  const int lane = threadIdx.x % GROUP_SIZE;
+  const int group = threadIdx.x / GROUP_SIZE;
+
+  const int b = blockIdx.z;
+  const int t = blockIdx.y;
+  const int qh = blockIdx.x * GROUPS_PER_BLOCK + group;
+  const bool active = (qh < query_heads);
+  // 越界线程组使用 Q 头 0 构造安全地址并继续参加同步，但最终不写回结果。
+  const int qh_safe = active ? qh : 0;
+
+  // GQA 中连续的多个 Q 头共享同一个 K/V 头。
+  const int kv_head = qh_safe / (query_heads / kv_heads);
+
+  const size_t q_base = (static_cast<size_t>(b) * target_seq_len * query_heads +
+                         static_cast<size_t>(t) * query_heads + qh_safe) *
+                        head_dim;
+  const size_t kv_batch_base =
+      static_cast<size_t>(b) * src_seq_len * kv_heads * head_dim;
+  const size_t kv_row_stride = static_cast<size_t>(kv_heads) * head_dim;
+
+  const T* q_ptr = q + q_base;
+  T* o_ptr = o + q_base;
+
+  // 每个 lane 将自己的 Q 分片和输出分片保存在寄存器中。
+  float q_reg[ITEMS_PER_LANE];
+  float acc[ITEMS_PER_LANE];
+
+#pragma unroll
+  for (int i = 0; i < ITEMS_PER_LANE; ++i) {
+    const int d = lane + i * GROUP_SIZE;
+    q_reg[i] = (d < head_dim) ? toFloat(q_ptr[d]) : 0.0f;
+    acc[i] = 0.0f;
+  }
+
+  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+  float running_max = FA_NEG_SENTINEL;
+  float running_sum = 0.0f;
+
+  // 因果模式仅保留 s<=t。s_end 只依赖 blockIdx.y，因此 block 内循环次数一致。
+  const int s_end =
+      is_causal ? ((t + 1 < src_seq_len) ? (t + 1) : src_seq_len) : src_seq_len;
+
+  for (int s0 = 0; s0 < s_end; s0 += TILE) {
+    const int rows_here = ((s_end - s0) < TILE) ? (s_end - s0) : TILE;
+
+    // 阶段 1：各 lane 计算当前 tile 每行 Q·K 的局部点积。
+    for (int r = 0; r < rows_here; ++r) {
+      const T* k_ptr =
+          k + kv_batch_base +
+          static_cast<size_t>(s0 + r) * kv_row_stride + kv_head * head_dim;
+      float dot = 0.0f;
+#pragma unroll
+      for (int i = 0; i < ITEMS_PER_LANE; ++i) {
+        const int d = lane + i * GROUP_SIZE;
+        if (d < head_dim) {
+          dot += q_reg[i] * toFloat(k_ptr[d]);
+        }
+      }
+      s_part[group][r][lane] = dot;
+    }
+    __syncthreads();
+
+    // 阶段 2：前 rows_here 个 lane 分别归约一行，得到完整缩放分数。
+    if (lane < rows_here) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int j = 0; j < GROUP_SIZE; ++j) {
+        sum += s_part[group][lane][j];
+      }
+      s_score[group][lane] = sum * scale;
+    }
+    __syncthreads();
+
+    // 阶段 3：将当前 tile 合并进在线 Softmax，并同步缩放历史分母和输出。
+    // 组内各 lane 读取相同共享分数，因此会得到完全一致的 Softmax 状态。
+    float tile_max = FA_NEG_SENTINEL;
+    for (int r = 0; r < rows_here; ++r) {
+      tile_max = fmaxf(tile_max, s_score[group][r]);
+    }
+
+    const float new_max = fmaxf(running_max, tile_max);
+    const float alpha = expf(running_max - new_max);
+    running_max = new_max;
+    running_sum *= alpha;
+#pragma unroll
+    for (int i = 0; i < ITEMS_PER_LANE; ++i) {
+      acc[i] *= alpha;
+    }
+
+    for (int r = 0; r < rows_here; ++r) {
+      const float beta = expf(s_score[group][r] - new_max);
+      running_sum += beta;
+      const T* v_ptr =
+          v + kv_batch_base +
+          static_cast<size_t>(s0 + r) * kv_row_stride + kv_head * head_dim;
+#pragma unroll
+      for (int i = 0; i < ITEMS_PER_LANE; ++i) {
+        const int d = lane + i * GROUP_SIZE;
+        if (d < head_dim) {
+          acc[i] += beta * toFloat(v_ptr[d]);
+        }
+      }
+    }
+    // 此处无需额外屏障：下一轮会在重新读取共享分数前执行 __syncthreads()。
+  }
+
+  if (!active) {
+    return;
+  }
+
+  // 有有效位置时最大分数贡献为 1，因此 running_sum 至少为 1；条件判断只保护退化情况。
+  const float inv_sum = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
+
+#pragma unroll
+  for (int i = 0; i < ITEMS_PER_LANE; ++i) {
+    const int d = lane + i * GROUP_SIZE;
+    if (d < head_dim) {
+      o_ptr[d] = fromFloat<T>(acc[i] * inv_sum);
+    }
+  }
+}
+
+/**
+ * @brief 汇总 MACA FlashAttention 使用的张量形状和派生参数
+ */
+struct MacaAttnParams {
+  int batch_size;           // 批次大小
+  int target_seq_len;       // Q 的序列长度
+  int src_seq_len;          // 设备端 K/V 的序列长度
+  int query_heads;          // Q 的注意力头数量
+  int kv_heads;             // K/V 的注意力头数量
+  int head_dim;             // 每个注意力头的维度
+  int query_heads_per_kv;   // 每个 K/V 头对应的 Q 头数量
+  bool is_causal;           // 是否使用因果掩码
+};
+
+/**
+ * @brief 使用运行期头维度执行严格两遍 FP32 FlashAttention
+ * @tparam ACC_CAP 每个线程的最大输出累加器容量
+ * @param q GPU 查询张量地址
+ * @param k GPU 键张量地址
+ * @param v GPU 值张量地址
+ * @param o GPU 输出张量地址
+ * @param p 注意力形状和掩码参数
+ */
+template <int ACC_CAP>
+__global__ void flashAttentionMacaFloatStrictKernel(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, float* __restrict__ o, MacaAttnParams p) {
+  // 一个线程处理一个查询，并从一维索引解码 batch、目标位置和 Q/KV 头。
+  const int query_index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int queries_per_batch = p.target_seq_len * p.query_heads;
+  const int total_queries = p.batch_size * queries_per_batch;
+  if (query_index >= total_queries) {
+    return;
+  }
+
+  // 展平顺序为 [batch, target_position, query_head]，逐层还原 b、t、qh。
+  const int b = query_index / queries_per_batch;
+  const int rem = query_index - b * queries_per_batch;
+  const int t = rem / p.query_heads;
+  const int qh = rem - t * p.query_heads;
+  // GQA 中每 query_heads_per_kv 个连续 Q 头共享一个 K/V 头。
+  const int kv_head = qh / p.query_heads_per_kv;
+
+  // Q/O 布局为 [B,T,QH,D]；K/V 布局为 [B,S,KVH,D]。
+  // q_base 定位当前 Q/O 行，kv_batch_base 和 kv_row_stride 用于定位任意 K/V 行。
+  const size_t q_base = static_cast<size_t>(query_index) * p.head_dim;
+  const size_t kv_batch_base =
+      static_cast<size_t>(b) * p.src_seq_len * p.kv_heads * p.head_dim;
+  const size_t kv_row_stride =
+      static_cast<size_t>(p.kv_heads) * p.head_dim;
+  // 非因果模式访问全部源位置；因果模式只允许访问位置 0 到 t。
+  const int s_end =
+      p.is_causal ? (((t + 1) < p.src_seq_len) ? (t + 1) : p.src_seq_len)
+                  : p.src_seq_len;
+  const float scale = rsqrtf(static_cast<float>(p.head_dim));
+  const float* q_ptr = q + q_base;
+
+  // 第一遍计算所有可见 K 的最大缩放分数，保证 Softmax 数值稳定。
+  float max_logit = FA_NEG_SENTINEL;
+  for (int s = 0; s < s_end; ++s) {
+    const size_t kv_base =
+        kv_batch_base + static_cast<size_t>(s) * kv_row_stride +
+        static_cast<size_t>(kv_head) * p.head_dim;
+    const float* k_ptr = k + kv_base;
+    float dot = 0.0f;
+    for (int d = 0; d < p.head_dim; ++d) {
+      dot = fmaf(q_ptr[d], k_ptr[d], dot);
+    }
+    max_logit = fmaxf(max_logit, dot * scale);
+  }
+
+  float acc[ACC_CAP];
+  for (int d = 0; d < p.head_dim; ++d) {
+    acc[d] = 0.0f;
+  }
+
+  // 第二遍重新计算分数，同时累加 Softmax 分母和未归一化的 weight·V。
+  float denom = 0.0f;
+  for (int s = 0; s < s_end; ++s) {
+    const size_t kv_base =
+        kv_batch_base + static_cast<size_t>(s) * kv_row_stride +
+        static_cast<size_t>(kv_head) * p.head_dim;
+    const float* k_ptr = k + kv_base;
+    const float* v_ptr = v + kv_base;
+    float dot = 0.0f;
+    for (int d = 0; d < p.head_dim; ++d) {
+      dot = fmaf(q_ptr[d], k_ptr[d], dot);
+    }
+    const float weight = expf(dot * scale - max_logit);
+    denom += weight;
+    for (int d = 0; d < p.head_dim; ++d) {
+      acc[d] = fmaf(weight, v_ptr[d], acc[d]);
+    }
+  }
+
+  // acc 保存 Σ exp(score-max)·V，除以 denom 后才是最终 Softmax 加权输出。
+  const float inv_denom = denom > 0.0f ? (1.0f / denom) : 0.0f;
+  for (int d = 0; d < p.head_dim; ++d) {
+    o[q_base + d] = acc[d] * inv_denom;
+  }
+}
+
+/**
+ * @brief 使用编译期固定头维度执行严格两遍 FP32 FlashAttention
+ * @tparam HEAD_DIM 每个注意力头的维度
+ * @param q GPU 查询张量地址
+ * @param k GPU 键张量地址
+ * @param v GPU 值张量地址
+ * @param o GPU 输出张量地址
+ * @param p 注意力形状和掩码参数
+ */
+template <int HEAD_DIM>
+__global__ void flashAttentionMacaFloatStrictFixedKernel(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, float* __restrict__ o, MacaAttnParams p) {
+  const int query_index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int queries_per_batch = p.target_seq_len * p.query_heads;
+  const int total_queries = p.batch_size * queries_per_batch;
+  if (query_index >= total_queries) {
+    return;
+  }
+
+  // 与运行期版本相同地解码查询坐标；HEAD_DIM 为编译期常量，可完全展开维度循环。
+  const int b = query_index / queries_per_batch;
+  const int rem = query_index - b * queries_per_batch;
+  const int t = rem / p.query_heads;
+  const int qh = rem - t * p.query_heads;
+  const int kv_head = qh / p.query_heads_per_kv;
+  const size_t q_base = static_cast<size_t>(query_index) * HEAD_DIM;
+  const size_t kv_batch_base =
+      static_cast<size_t>(b) * p.src_seq_len * p.kv_heads * HEAD_DIM;
+  const size_t kv_row_stride = static_cast<size_t>(p.kv_heads) * HEAD_DIM;
+  const int s_end =
+      p.is_causal ? (((t + 1) < p.src_seq_len) ? (t + 1) : p.src_seq_len)
+                  : p.src_seq_len;
+  const float scale = rsqrtf(static_cast<float>(p.head_dim));
+  const float* q_ptr = q + q_base;
+
+  // 第一遍只求最大缩放分数，不保存 logits，从而减少临时全局内存占用。
+  float max_logit = FA_NEG_SENTINEL;
+  for (int s = 0; s < s_end; ++s) {
+    const size_t kv_base =
+        kv_batch_base + static_cast<size_t>(s) * kv_row_stride +
+        static_cast<size_t>(kv_head) * HEAD_DIM;
+    const float* k_ptr = k + kv_base;
+    float dot = 0.0f;
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) {
+      dot = fmaf(q_ptr[d], k_ptr[d], dot);
+    }
+    max_logit = fmaxf(max_logit, dot * scale);
+  }
+
+  float acc[HEAD_DIM];
+#pragma unroll
+  for (int d = 0; d < HEAD_DIM; ++d) {
+    acc[d] = 0.0f;
+  }
+
+  // 第二遍重新计算分数，并同时累加分母与每个输出维度的 V 加权和。
+  float denom = 0.0f;
+  for (int s = 0; s < s_end; ++s) {
+    const size_t kv_base =
+        kv_batch_base + static_cast<size_t>(s) * kv_row_stride +
+        static_cast<size_t>(kv_head) * HEAD_DIM;
+    const float* k_ptr = k + kv_base;
+    const float* v_ptr = v + kv_base;
+    float dot = 0.0f;
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) {
+      dot = fmaf(q_ptr[d], k_ptr[d], dot);
+    }
+    const float weight = expf(dot * scale - max_logit);
+    denom += weight;
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) {
+      acc[d] = fmaf(weight, v_ptr[d], acc[d]);
+    }
+  }
+
+  // 最后统一归一化并写回布局相同的 O 行。
+  const float inv_denom = denom > 0.0f ? (1.0f / denom) : 0.0f;
+#pragma unroll
+  for (int d = 0; d < HEAD_DIM; ++d) {
+    o[q_base + d] = acc[d] * inv_denom;
+  }
+}
+
+/**
+ * @brief 保存 MACA K/V 分块 Kernel 中一个查询的坐标、边界和地址偏移
+ */
+struct MacaKVTiledCoord {
+  int b;                    // 当前 batch 编号
+  int qh;                   // 当前 Q 头编号
+  int t0;                   // 当前查询 tile 的起始位置
+  int t;                    // 当前查询位置
+  int kv_head;              // 对应的 K/V 头编号
+  int s_end;                // 当前查询允许访问的 K/V 行数
+  int block_s_end;          // 整个 block 需要加载的 K/V 行数
+  size_t q_base;            // 当前 Q/O 行首偏移
+  size_t kv_batch_base;     // 当前 batch 的 K/V 起始偏移
+  bool active;              // 当前查询是否有效
+};
+
+/**
+ * @brief 解码 MACA K/V 分块任务并计算查询坐标和访问边界
+ * @tparam HEAD_DIM 每个注意力头的维度
+ * @tparam QUERIES_PER_BLOCK 每个 block 处理的查询数量
+ * @param block_index 当前 block 的一维索引
+ * @param query_in_block 当前查询在 block 内的编号
+ * @param p 注意力形状和掩码参数
+ * @return 当前分块查询的坐标与边界信息
+ */
+template <int HEAD_DIM, int QUERIES_PER_BLOCK>
+__device__ __forceinline__ MacaKVTiledCoord decodeMacaKVTiledQuery(
+    int block_index, int query_in_block, const MacaAttnParams& p) {
+  MacaKVTiledCoord c;
+  // 将 block_index 按 [batch, Q 头, target tile] 的布局逐层解码。
+  const int target_tiles =
+      (p.target_seq_len + QUERIES_PER_BLOCK - 1) / QUERIES_PER_BLOCK;
+  const int tiles_per_batch = p.query_heads * target_tiles;
+  c.b = block_index / tiles_per_batch;
+  const int block_rem = block_index - c.b * tiles_per_batch;
+  c.qh = block_rem / target_tiles;
+  const int target_tile = block_rem - c.qh * target_tiles;
+  // t0 是查询 tile 的第一个目标位置，query_in_block 决定组内的具体查询 t。
+  c.t0 = target_tile * QUERIES_PER_BLOCK;
+  c.t = c.t0 + query_in_block;
+  c.active = c.t < p.target_seq_len;
+  // 最后一个 tile 可能不满，无效查询使用 safe_t=0 构造安全地址但不参与计算。
+  const int safe_t = c.active ? c.t : 0;
+  // 将当前 Q 头映射到共享的 K/V 头，并按 [B,T,QH,D] 计算 Q/O 行首偏移。
+  c.kv_head = c.qh / p.query_heads_per_kv;
+  c.q_base =
+      (static_cast<size_t>(c.b) * p.target_seq_len * p.query_heads +
+       static_cast<size_t>(safe_t) * p.query_heads + c.qh) *
+      HEAD_DIM;
+  c.kv_batch_base =
+      static_cast<size_t>(c.b) * p.src_seq_len * p.kv_heads * HEAD_DIM;
+  // s_end 是单查询因果边界，block_s_end 是整个查询 tile 的最大加载边界。
+  c.s_end = c.active
+                ? (p.is_causal
+                       ? (((c.t + 1) < p.src_seq_len) ? (c.t + 1)
+                                                       : p.src_seq_len)
+                       : p.src_seq_len)
+                : 0;
+  // 整个 block 需要加载到本查询 tile 的最远有效位置，且不能超过源序列末尾。
+  const int block_target_end =
+      ((c.t0 + QUERIES_PER_BLOCK) < p.target_seq_len)
+          ? (c.t0 + QUERIES_PER_BLOCK)
+          : p.target_seq_len;
+  c.block_s_end =
+      p.is_causal
+          ? ((block_target_end < p.src_seq_len) ? block_target_end
+                                                 : p.src_seq_len)
+          : p.src_seq_len;
+  return c;
+}
+
+/**
+ * @brief 对 K/V 分块并使用严格三遍扫描计算 FP32 FlashAttention
+ * @tparam HEAD_DIM 每个注意力头的维度
+ * @tparam GROUP_SIZE 每个查询使用的线程数
+ * @tparam QUERIES_PER_BLOCK 每个 block 处理的查询数量
+ * @tparam KV_TILE 每次载入共享内存的 K/V 行数
+ * @tparam SCORE_TILE 每组缓存的注意力分数数量
+ * @param q GPU 查询张量地址
+ * @param k GPU 键张量地址
+ * @param v GPU 值张量地址
+ * @param o GPU 输出张量地址
+ * @param p 注意力形状和掩码参数
+ */
+template <int HEAD_DIM, int GROUP_SIZE, int QUERIES_PER_BLOCK, int KV_TILE,
+          int SCORE_TILE>
+__global__ void flashAttentionMacaFloatKVTiledKernel(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, float* __restrict__ o, MacaAttnParams p) {
+  static_assert(HEAD_DIM <= GROUP_SIZE,
+                "float tiled kernel assigns at most one output per lane");
+
+  // 所有查询组共享 K/V tile；Q 与小块 logits 也存入共享内存供顺序计算。
+  __shared__ float k_tile[KV_TILE * HEAD_DIM];
+  __shared__ float v_tile[KV_TILE * HEAD_DIM];
+  __shared__ float q_shared[QUERIES_PER_BLOCK][HEAD_DIM];
+  __shared__ float scores[QUERIES_PER_BLOCK][SCORE_TILE];
+
+  const int lane = threadIdx.x % GROUP_SIZE;
+  const int group = threadIdx.x / GROUP_SIZE;
+  // 每个线程组对应一个查询；lane 0..HEAD_DIM-1 分别负责一个输出维度。
+  const MacaKVTiledCoord c =
+      decodeMacaKVTiledQuery<HEAD_DIM, QUERIES_PER_BLOCK>(blockIdx.x, group, p);
+  // 将离散 lane 读取的 Q 合并为共享内存中的连续行，供各分数行顺序点积复用。
+  if (lane < HEAD_DIM) {
+    q_shared[group][lane] = c.active ? q[c.q_base + lane] : 0.0f;
+  }
+  __syncthreads();
+
+  float max_logit = FA_NEG_SENTINEL;
+  float denom = 0.0f;
+  float acc = 0.0f;
+  const float scale = rsqrtf(static_cast<float>(HEAD_DIM));
+  const size_t kv_row_stride =
+      static_cast<size_t>(p.kv_heads) * HEAD_DIM;
+
+  // 三遍分别求整行最大值、Softmax 分母和 V 加权和，避免在线合并的舍入漂移。
+  for (int pass = 0; pass < 3; ++pass) {
+    for (int s0 = 0; s0 < c.block_s_end; s0 += KV_TILE) {
+      const int rows = ((c.block_s_end - s0) < KV_TILE)
+                           ? (c.block_s_end - s0)
+                           : KV_TILE;
+      // block 内线程协作加载 K；只有输出遍需要同时加载 V。
+      for (int idx = threadIdx.x; idx < rows * HEAD_DIM; idx += blockDim.x) {
+        const int row = idx / HEAD_DIM;
+        const int d = idx - row * HEAD_DIM;
+        const size_t source =
+            c.kv_batch_base + static_cast<size_t>(s0 + row) * kv_row_stride +
+            static_cast<size_t>(c.kv_head) * HEAD_DIM + d;
+        k_tile[idx] = k[source];
+        if (pass == 2) {
+          v_tile[idx] = v[source];
+        }
+      }
+      __syncthreads();
+
+      // 当前查询在这个 K/V tile 中实际可见的行数；因果边界之外的行不参与三遍扫描。
+      const int remaining = c.s_end - s0;
+      const int query_rows =
+          remaining > 0 ? ((remaining < rows) ? remaining : rows) : 0;
+      for (int row0 = 0; row0 < rows; row0 += SCORE_TILE) {
+        const int score_rows =
+            ((rows - row0) < SCORE_TILE) ? (rows - row0) : SCORE_TILE;
+        // 前 score_rows 个 lane 各负责一行完整 Q·K，结果写入本查询组的分数缓存。
+        if (lane < score_rows) {
+          float dot = 0.0f;
+#pragma unroll
+          for (int d = 0; d < HEAD_DIM; ++d) {
+            dot = fmaf(q_shared[group][d],
+                       k_tile[(row0 + lane) * HEAD_DIM + d], dot);
+          }
+          scores[group][lane] = dot * scale;
+        }
+        __syncthreads();
+
+        const int valid_remaining = query_rows - row0;
+        const int valid_rows =
+            valid_remaining > 0
+                ? ((valid_remaining < score_rows) ? valid_remaining
+                                                   : score_rows)
+                : 0;
+        // 根据当前遍次分别更新最大值、分母或当前 lane 对应的输出分量。
+        // pass=0 求 max；pass=1 求 Σexp(score-max)；pass=2 求 Σweight·V。
+        if (pass == 0) {
+          for (int row = 0; row < valid_rows; ++row) {
+            max_logit = fmaxf(max_logit, scores[group][row]);
+          }
+        } else if (pass == 1) {
+          for (int row = 0; row < valid_rows; ++row) {
+            denom += expf(scores[group][row] - max_logit);
+          }
+        } else {
+          for (int row = 0; row < valid_rows; ++row) {
+            const float weight = expf(scores[group][row] - max_logit);
+            if (lane < HEAD_DIM) {
+              acc = fmaf(weight, v_tile[(row0 + row) * HEAD_DIM + lane], acc);
+            }
+          }
+        }
+        __syncthreads();
+      }
+      __syncthreads();
+    }
+  }
+
+  // 最后一个查询 tile 可能不满，仅有效查询和有效输出维度执行归一化写回。
+  if (c.active && lane < HEAD_DIM) {
+    const float inv_denom = denom > 0.0f ? (1.0f / denom) : 0.0f;
+    o[c.q_base + lane] = acc * inv_denom;
+  }
+}
+
+/**
+ * @brief 对 K/V 分块并使用在线 Softmax 计算 half FlashAttention
+ * @tparam T 输入和输出张量的数据类型
+ * @tparam HEAD_DIM 每个注意力头的维度
+ * @tparam GROUP_SIZE 每个查询使用的线程数
+ * @tparam QUERIES_PER_BLOCK 每个 block 处理的查询数量
+ * @tparam KV_TILE 每次载入共享内存的 K/V 行数
+ * @tparam SCORE_TILE 每组缓存的注意力分数数量
+ * @param q GPU 查询张量地址
+ * @param k GPU 键张量地址
+ * @param v GPU 值张量地址
+ * @param o GPU 输出张量地址
+ * @param p 注意力形状和掩码参数
+ */
+template <typename T, int HEAD_DIM, int GROUP_SIZE, int QUERIES_PER_BLOCK,
+          int KV_TILE, int SCORE_TILE>
+__global__ void flashAttentionMacaHalfKVTiledKernel(
+    const T* __restrict__ q, const T* __restrict__ k,
+    const T* __restrict__ v, T* __restrict__ o, MacaAttnParams p) {
+  static_assert(HEAD_DIM <= GROUP_SIZE,
+                "half tiled kernel assigns at most one output per lane");
+
+  // K/V tile 由整个 block 共享，partial 和 scores 用于线程组内点积归约。
+  __shared__ T k_tile[KV_TILE * HEAD_DIM];
+  __shared__ T v_tile[KV_TILE * HEAD_DIM];
+  __shared__ float partial[QUERIES_PER_BLOCK][SCORE_TILE][GROUP_SIZE + 1];
+  __shared__ float scores[QUERIES_PER_BLOCK][SCORE_TILE];
+
+  const int lane = threadIdx.x % GROUP_SIZE;
+  const int group = threadIdx.x / GROUP_SIZE;
+  // 每组负责一个查询，每个有效 lane 保存一个 Q 分量及对应的输出标量。
+  const MacaKVTiledCoord c =
+      decodeMacaKVTiledQuery<HEAD_DIM, QUERIES_PER_BLOCK>(blockIdx.x, group, p);
+  const float q_value =
+      (c.active && lane < HEAD_DIM) ? toFloat(q[c.q_base + lane]) : 0.0f;
+  float acc = 0.0f;
+  float running_max = FA_NEG_SENTINEL;
+  float running_sum = 0.0f;
+  const float scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+  const size_t kv_row_stride =
+      static_cast<size_t>(p.kv_heads) * HEAD_DIM;
+
+  // 沿源序列推进 K/V tile，每轮装载一次后供 block 内多个查询共同使用。
+  for (int s0 = 0; s0 < c.block_s_end; s0 += KV_TILE) {
+    const int rows = ((c.block_s_end - s0) < KV_TILE)
+                         ? (c.block_s_end - s0)
+                         : KV_TILE;
+    // 整个 block 协作把当前 K/V tile 从全局内存搬到共享内存。
+    for (int idx = threadIdx.x; idx < rows * HEAD_DIM; idx += blockDim.x) {
+      const int row = idx / HEAD_DIM;
+      const int d = idx - row * HEAD_DIM;
+      const size_t source =
+          c.kv_batch_base + static_cast<size_t>(s0 + row) * kv_row_stride +
+          static_cast<size_t>(c.kv_head) * HEAD_DIM + d;
+      k_tile[idx] = k[source];
+      v_tile[idx] = v[source];
+    }
+    __syncthreads();
+
+    // query_rows 表示当前查询在本 tile 中实际允许访问的行数。
+    const int remaining = c.s_end - s0;
+    const int query_rows =
+        remaining > 0 ? ((remaining < rows) ? remaining : rows) : 0;
+    for (int row0 = 0; row0 < rows; row0 += SCORE_TILE) {
+      const int score_rows =
+          ((rows - row0) < SCORE_TILE) ? (rows - row0) : SCORE_TILE;
+      // 每个 lane 先计算自己负责维度的 Q[d]·K[row,d] 局部乘积。
+      for (int row = 0; row < score_rows; ++row) {
+        const float dot = lane < HEAD_DIM
+                              ? q_value *
+                                    toFloat(k_tile[(row0 + row) * HEAD_DIM + lane])
+                              : 0.0f;
+        partial[group][row][lane] = dot;
+      }
+      __syncthreads();
+
+      // 前 score_rows 个 lane 分别读取所有局部乘积，完成一行点积归约和缩放。
+      if (lane < score_rows) {
+        float dot = 0.0f;
+#pragma unroll
+        for (int source_lane = 0; source_lane < GROUP_SIZE; ++source_lane) {
+          dot += partial[group][lane][source_lane];
+        }
+        scores[group][lane] = dot * scale;
+      }
+      __syncthreads();
+
+      const int valid_remaining = query_rows - row0;
+      const int valid_rows =
+          valid_remaining > 0
+              ? ((valid_remaining < score_rows) ? valid_remaining : score_rows)
+              : 0;
+      float tile_max = FA_NEG_SENTINEL;
+      // beta 是新最大值基准下的当前行权重，各 lane 用它更新自己的 V 输出分量。
+      for (int row = 0; row < valid_rows; ++row) {
+        tile_max = fmaxf(tile_max, scores[group][row]);
+      }
+      // 将当前分数小块合并到在线 Softmax 状态，并重缩放历史输出。
+      const float new_max = fmaxf(running_max, tile_max);
+      const float alpha = expf(running_max - new_max);
+      running_max = new_max;
+      running_sum *= alpha;
+      acc *= alpha;
+
+      for (int row = 0; row < valid_rows; ++row) {
+        const float beta = expf(scores[group][row] - new_max);
+        running_sum += beta;
+        if (lane < HEAD_DIM) {
+          acc += beta * toFloat(v_tile[(row0 + row) * HEAD_DIM + lane]);
+        }
+      }
+      __syncthreads();
+    }
+    __syncthreads();
+  }
+
+  // 在线累加得到的是未归一化结果，最后除以 running_sum 并转换回存储类型。
+  if (c.active && lane < HEAD_DIM) {
+    const float inv_sum = running_sum > 0.0f ? (1.0f / running_sum) : 0.0f;
+    o[c.q_base + lane] = fromFloat<T>(acc * inv_sum);
+  }
+}
+
+/**
+ * @brief 判断当前形状是否适合使用 MACA K/V 分块路径
+ * @param total_queries 查询总数
+ * @param target_seq_len Q 的序列长度
+ * @param src_seq_len K/V 的序列长度
+ * @param head_dim 每个注意力头的维度
+ * @param min_sequence 启用分块路径所需的最小序列长度
+ * @return 满足分块条件时返回 true，否则返回 false
+ */
+inline bool shouldUseMacaKVTiled(size_t total_queries, int target_seq_len,
+                                 int src_seq_len, int head_dim,
+                                 int min_sequence) {
+  return total_queries >= MACA_KV_TILED_MIN_QUERIES &&
+         target_seq_len >= min_sequence && src_seq_len >= min_sequence &&
+         (head_dim == 32 || head_dim == 64);
+}
+
+/**
+ * @brief 根据 head_dim 启动 FP32 MACA K/V 分块 Kernel
+ * @param d_q GPU 查询张量地址
+ * @param d_k GPU 键张量地址
+ * @param d_v GPU 值张量地址
+ * @param d_o GPU 输出张量地址
+ * @param params 注意力形状和掩码参数
+ */
+inline void launchMacaKVTiled(const float* d_q, const float* d_k,
+                              const float* d_v, float* d_o,
+                              const MacaAttnParams& params) {
+  // D32 使用 32 线程组、每 block 16 个查询；D64 使用 64 线程组、每 block 8 个查询。
+  if (params.head_dim == 32) {
+    constexpr int GROUP_SIZE = 32;
+    constexpr int QUERIES_PER_BLOCK = 16;
+    const int target_tiles =
+        (params.target_seq_len + QUERIES_PER_BLOCK - 1) / QUERIES_PER_BLOCK;
+    const int blocks = params.batch_size * params.query_heads * target_tiles;
+    flashAttentionMacaFloatKVTiledKernel<
+        32, GROUP_SIZE, QUERIES_PER_BLOCK, MACA_KV_TILE_ROWS,
+        MACA_SCORE_TILE_ROWS><<<blocks, GROUP_SIZE * QUERIES_PER_BLOCK>>>(
+        d_q, d_k, d_v, d_o, params);
+  } else {
+    constexpr int GROUP_SIZE = 64;
+    constexpr int QUERIES_PER_BLOCK = 8;
+    const int target_tiles =
+        (params.target_seq_len + QUERIES_PER_BLOCK - 1) / QUERIES_PER_BLOCK;
+    const int blocks = params.batch_size * params.query_heads * target_tiles;
+    flashAttentionMacaFloatKVTiledKernel<
+        64, GROUP_SIZE, QUERIES_PER_BLOCK, MACA_FLOAT_HEAD64_KV_TILE_ROWS,
+        MACA_SCORE_TILE_ROWS><<<blocks, GROUP_SIZE * QUERIES_PER_BLOCK>>>(
+        d_q, d_k, d_v, d_o, params);
+  }
+}
+
+/**
+ * @brief 根据 head_dim 启动 half MACA K/V 分块 Kernel
+ * @param d_q GPU 查询张量地址
+ * @param d_k GPU 键张量地址
+ * @param d_v GPU 值张量地址
+ * @param d_o GPU 输出张量地址
+ * @param params 注意力形状和掩码参数
+ */
+inline void launchMacaKVTiled(const half* d_q, const half* d_k,
+                              const half* d_v, half* d_o,
+                              const MacaAttnParams& params) {
+  // half 与 float 使用相同查询映射，但 D64 可使用更大的 K/V tile。
+  if (params.head_dim == 32) {
+    constexpr int GROUP_SIZE = 32;
+    constexpr int QUERIES_PER_BLOCK = 16;
+    const int target_tiles =
+        (params.target_seq_len + QUERIES_PER_BLOCK - 1) / QUERIES_PER_BLOCK;
+    const int blocks = params.batch_size * params.query_heads * target_tiles;
+    flashAttentionMacaHalfKVTiledKernel<
+        half, 32, GROUP_SIZE, QUERIES_PER_BLOCK, MACA_KV_TILE_ROWS,
+        MACA_SCORE_TILE_ROWS><<<blocks, GROUP_SIZE * QUERIES_PER_BLOCK>>>(
+        d_q, d_k, d_v, d_o, params);
+  } else {
+    constexpr int GROUP_SIZE = 64;
+    constexpr int QUERIES_PER_BLOCK = 8;
+    const int target_tiles =
+        (params.target_seq_len + QUERIES_PER_BLOCK - 1) / QUERIES_PER_BLOCK;
+    const int blocks = params.batch_size * params.query_heads * target_tiles;
+    flashAttentionMacaHalfKVTiledKernel<
+        half, 64, GROUP_SIZE, QUERIES_PER_BLOCK, MACA_KV_TILE_ROWS,
+        MACA_SCORE_TILE_ROWS><<<blocks, GROUP_SIZE * QUERIES_PER_BLOCK>>>(
+        d_q, d_k, d_v, d_o, params);
+  }
+}
+
+/**
+ * @brief 按头维度容量档位启动 FP32 MACA 回退 Kernel
+ * @param d_q GPU 查询张量地址
+ * @param d_k GPU 键张量地址
+ * @param d_v GPU 值张量地址
+ * @param d_o GPU 输出张量地址
+ * @param params 注意力形状和掩码参数
+ */
+inline void launchMacaFallback(const float* d_q, const float* d_k,
+                               const float* d_v, float* d_o,
+                               const MacaAttnParams& params) {
+  constexpr int THREADS = 128;
+  const int total_queries =
+      params.batch_size * params.target_seq_len * params.query_heads;
+  const int blocks = (total_queries + THREADS - 1) / THREADS;
+  // 因果 D32 使用编译期定长特化，其余维度按最小可容纳的累加器容量分派。
+  if (params.is_causal && params.head_dim == 32) {
+    flashAttentionMacaFloatStrictFixedKernel<32><<<blocks, THREADS>>>(
+        d_q, d_k, d_v, d_o, params);
+  } else if (params.head_dim <= 32) {
+    flashAttentionMacaFloatStrictKernel<32><<<blocks, THREADS>>>(
+        d_q, d_k, d_v, d_o, params);
+  } else if (params.head_dim <= 64) {
+    flashAttentionMacaFloatStrictKernel<64><<<blocks, THREADS>>>(
+        d_q, d_k, d_v, d_o, params);
+  } else if (params.head_dim <= 128) {
+    flashAttentionMacaFloatStrictKernel<128><<<blocks, THREADS>>>(
+        d_q, d_k, d_v, d_o, params);
+  } else if (params.head_dim <= 256) {
+    flashAttentionMacaFloatStrictKernel<256><<<blocks, THREADS>>>(
+        d_q, d_k, d_v, d_o, params);
+  } else if (params.head_dim <= 512) {
+    flashAttentionMacaFloatStrictKernel<512><<<blocks, THREADS>>>(
+        d_q, d_k, d_v, d_o, params);
+  } else {
+    flashAttentionMacaFloatStrictKernel<1024><<<blocks, THREADS>>>(
+        d_q, d_k, d_v, d_o, params);
+  }
+}
+
+/**
+ * @brief 按头维度容量档位启动 half MACA 线程组回退 Kernel
+ * @param d_q GPU 查询张量地址
+ * @param d_k GPU 键张量地址
+ * @param d_v GPU 值张量地址
+ * @param d_o GPU 输出张量地址
+ * @param params 注意力形状和掩码参数
+ */
+inline void launchMacaFallback(const half* d_q, const half* d_k,
+                               const half* d_v, half* d_o,
+                               const MacaAttnParams& params) {
+  constexpr int GROUP_SIZE = MACA_GROUP_SIZE;
+  constexpr int GROUPS_PER_BLOCK = MACA_GROUPS_PER_BLOCK;
+  constexpr int TILE = MACA_K_TILE;
+  constexpr int MAX_HEAD_DIM = 1024;
+  // 网格布局为 [Q 头组, 目标位置, batch]，因此 block 内线程拥有统一的因果边界。
+  const dim3 block(GROUP_SIZE * GROUPS_PER_BLOCK);
+  const dim3 grid(
+      static_cast<unsigned int>((params.query_heads + GROUPS_PER_BLOCK - 1) /
+                                GROUPS_PER_BLOCK),
+      static_cast<unsigned int>(params.target_seq_len),
+      static_cast<unsigned int>(params.batch_size));
+  // 选择不小于实际 head_dim 的编译期容量桶，限制每个 lane 的寄存器数组大小。
+  if (params.head_dim <= GROUP_SIZE) {
+    flashAttentionGroupKernel<half, GROUP_SIZE, GROUPS_PER_BLOCK, GROUP_SIZE,
+                              TILE><<<grid, block>>>(
+        d_q, d_k, d_v, d_o, params.target_seq_len, params.src_seq_len,
+        params.query_heads, params.kv_heads, params.head_dim, params.is_causal);
+  } else if (params.head_dim <= 2 * GROUP_SIZE) {
+    flashAttentionGroupKernel<half, GROUP_SIZE, GROUPS_PER_BLOCK,
+                              2 * GROUP_SIZE, TILE><<<grid, block>>>(
+        d_q, d_k, d_v, d_o, params.target_seq_len, params.src_seq_len,
+        params.query_heads, params.kv_heads, params.head_dim, params.is_causal);
+  } else if (params.head_dim <= 4 * GROUP_SIZE) {
+    flashAttentionGroupKernel<half, GROUP_SIZE, GROUPS_PER_BLOCK,
+                              4 * GROUP_SIZE, TILE><<<grid, block>>>(
+        d_q, d_k, d_v, d_o, params.target_seq_len, params.src_seq_len,
+        params.query_heads, params.kv_heads, params.head_dim, params.is_causal);
+  } else {
+    flashAttentionGroupKernel<half, GROUP_SIZE, GROUPS_PER_BLOCK, MAX_HEAD_DIM,
+                              TILE><<<grid, block>>>(
+        d_q, d_k, d_v, d_o, params.target_seq_len, params.src_seq_len,
+        params.query_heads, params.kv_heads, params.head_dim, params.is_causal);
+  }
+}
 
 /**
  * @brief Computes RMSNorm over the last dimension of a 2D tensor.
@@ -23,14 +1056,54 @@
  */
 template <typename T>
 void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
-              std::vector<T>& h_output, size_t rows, size_t hidden_dim,
-              float eps) {
-  // TODO: Implement the rmsNorm function
+             std::vector<T>& h_output, size_t rows, size_t hidden_dim,
+             float eps) {
+  // Host 输入按 [rows, hidden_dim] 展平，输出需要相同数量的元素。
+  const size_t input_elems = rows * hidden_dim;
+  h_output.resize(input_elems);
+  if (input_elems == 0) {
+    return;
+  }
+
+  // 重复调用时复用三块设备内存，避免每轮测试都执行昂贵的分配和释放。
+  static thread_local ReusableDeviceBuffer<T> input_buffer;
+  static thread_local ReusableDeviceBuffer<T> weight_buffer;
+  static thread_local ReusableDeviceBuffer<T> output_buffer;
+
+  input_buffer.ensure(input_elems);
+  weight_buffer.ensure(hidden_dim);
+  output_buffer.ensure(input_elems);
+
+  T* d_input = input_buffer.data();
+  T* d_weight = weight_buffer.data();
+  T* d_output = output_buffer.data();
+
+  // 将输入矩阵和逐列权重复制到设备，输出由 Kernel 直接写入 d_output。
+  RUNTIME_CHECK(mcMemcpy(d_input, h_input.data(), input_elems * sizeof(T),
+                         mcMemcpyHostToDevice));
+  RUNTIME_CHECK(mcMemcpy(d_weight, h_weight.data(), hidden_dim * sizeof(T),
+                         mcMemcpyHostToDevice));
+
+  // 选择不超过 256 和 hidden_dim 的最大 2 的幂，以满足树形归约要求。
+  int threads = 1;
+  while (threads * 2 <= 256 && static_cast<size_t>(threads * 2) <= hidden_dim) {
+    threads *= 2;
+  }
+  // 一个 block 对应一行；动态共享内存为每个线程提供一个 FP32 归约槽位。
+  const dim3 blocks(static_cast<unsigned int>(rows));
+  const size_t shared_mem = static_cast<size_t>(threads) * sizeof(float);
+  rmsNormKernel<T><<<blocks, threads, shared_mem>>>(d_input, d_weight, d_output,
+                                                    rows, hidden_dim, eps);
+  RUNTIME_CHECK(mcGetLastError());
+
+  // 默认流中的阻塞 D2H 拷贝会等待 Kernel 完成，无需额外设备同步。
+  RUNTIME_CHECK(mcMemcpy(h_output.data(), d_output, input_elems * sizeof(T),
+                         mcMemcpyDeviceToHost));
 }
 
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
- * 
+ *
  * @tparam T Data type (float) for input/output tensors
  * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
@@ -38,7 +1111,7 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
  * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] batch_size Batch dimension size
  * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length  
+ * @param[in] src_seq_len Source sequence length
  * @param[in] query_heads Number of query attention heads
  * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
  * @param[in] head_dim Dimension size of each attention head
@@ -47,9 +1120,126 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+                    int batch_size, int target_seq_len, int src_seq_len,
+                    int query_heads, int kv_heads, int head_dim,
+                    bool is_causal) {
+  // 首先检查基本形状以及 GQA 约束：Q 头数必须能被 K/V 头数整除。
+  if (batch_size < 0 || target_seq_len < 0 || src_seq_len < 0 ||
+      query_heads <= 0 || kv_heads <= 0 || head_dim <= 0) {
+    throw std::invalid_argument(
+        "flashAttention: invalid non-positive shape parameter");
+  }
+  if (query_heads % kv_heads != 0) {
+    throw std::invalid_argument(
+        "flashAttention: query_heads must be divisible by kv_heads");
+  }
+
+  constexpr int MAX_HEAD_DIM = 1024;
+
+  // 所有回退 Kernel 的最大编译期容量都是 1024，超过后没有安全的累加器档位。
+  if (head_dim > MAX_HEAD_DIM) {
+    throw std::invalid_argument(
+        "flashAttention: head_dim exceeds maximum supported value");
+  }
+
+  // target_seq_len 映射到 grid.y；超过上限时主动报错，避免静默丢失位置。
+  if (target_seq_len > 65535) {
+    throw std::invalid_argument(
+        "flashAttention: target_seq_len exceeds the grid.y limit");
+  }
+
+  // 计算 Host 张量元素数；因果模式只为实际可访问的 K/V 前缀分配设备空间。
+  const size_t q_elems =
+      static_cast<size_t>(batch_size) * target_seq_len * query_heads * head_dim;
+  const size_t kv_elems =
+      static_cast<size_t>(batch_size) * src_seq_len * kv_heads * head_dim;
+  const int device_src_seq_len =
+      is_causal ? ((target_seq_len < src_seq_len) ? target_seq_len : src_seq_len)
+                : src_seq_len;
+  const size_t device_kv_elems = static_cast<size_t>(batch_size) *
+                                 device_src_seq_len * kv_heads * head_dim;
+  // 输出形状与 Q 相同；任一张量为空时无需启动 Kernel，直接返回零输出。
+  h_o.resize(q_elems);
+  if (q_elems == 0 || kv_elems == 0) {
+    std::fill(h_o.begin(), h_o.end(), fromFloat<T>(0.0f));
+    return;
+  }
+
+  // 每个 Host 线程复用独立的 Q/K/V/O 设备缓冲区。
+  static thread_local ReusableDeviceBuffer<T> q_buffer;
+  static thread_local ReusableDeviceBuffer<T> k_buffer;
+  static thread_local ReusableDeviceBuffer<T> v_buffer;
+  static thread_local ReusableDeviceBuffer<T> o_buffer;
+
+  // K/V 设备缓冲区按 device_src_seq_len 分配，因果模式可小于 Host 原始长度。
+  q_buffer.ensure(q_elems);
+  k_buffer.ensure(device_kv_elems);
+  v_buffer.ensure(device_kv_elems);
+  o_buffer.ensure(q_elems);
+
+  T* d_q = q_buffer.data();
+  T* d_k = k_buffer.data();
+  T* d_v = v_buffer.data();
+  T* d_o = o_buffer.data();
+
+  // 复制 Q；因果模式逐 batch 复制截断后的 K/V 前缀。
+  RUNTIME_CHECK(
+      mcMemcpy(d_q, h_q.data(), q_elems * sizeof(T), mcMemcpyHostToDevice));
+  if (device_src_seq_len == src_seq_len) {
+    RUNTIME_CHECK(
+        mcMemcpy(d_k, h_k.data(), kv_elems * sizeof(T), mcMemcpyHostToDevice));
+    RUNTIME_CHECK(
+        mcMemcpy(d_v, h_v.data(), kv_elems * sizeof(T), mcMemcpyHostToDevice));
+  } else {
+    const size_t host_batch_elems =
+        static_cast<size_t>(src_seq_len) * kv_heads * head_dim;
+    const size_t device_batch_elems =
+        static_cast<size_t>(device_src_seq_len) * kv_heads * head_dim;
+    // MACA 这里逐 batch 复制连续前缀，跳过 Host 每个 batch 尾部不可访问的 K/V。
+    for (int b = 0; b < batch_size; ++b) {
+      RUNTIME_CHECK(mcMemcpy(d_k + static_cast<size_t>(b) * device_batch_elems,
+                             h_k.data() + static_cast<size_t>(b) * host_batch_elems,
+                             device_batch_elems * sizeof(T),
+                             mcMemcpyHostToDevice));
+      RUNTIME_CHECK(mcMemcpy(d_v + static_cast<size_t>(b) * device_batch_elems,
+                             h_v.data() + static_cast<size_t>(b) * host_batch_elems,
+                             device_batch_elems * sizeof(T),
+                             mcMemcpyHostToDevice));
+    }
+  }
+
+  // 根据数据类型、序列规模和头维度选择 K/V 分块或保守回退路径。
+  const size_t total_queries =
+      static_cast<size_t>(batch_size) * target_seq_len * query_heads;
+  const int tiled_min_sequence =
+      std::is_same<T, float>::value ? MACA_FLOAT_KV_TILED_MIN_SEQUENCE
+                                    : MACA_HALF_KV_TILED_MIN_SEQUENCE;
+  // 因果 FP32 保留严格回退路径；其他类型只有规模足够大且 D=32/64 时才分块。
+  const bool use_kv_tiled =
+      !(std::is_same<T, float>::value && is_causal) &&
+      shouldUseMacaKVTiled(total_queries, target_seq_len, device_src_seq_len,
+                           head_dim, tiled_min_sequence);
+  const MacaAttnParams params{batch_size,
+                              target_seq_len,
+                              device_src_seq_len,
+                              query_heads,
+                              kv_heads,
+                              head_dim,
+                              query_heads / kv_heads,
+                              is_causal};
+
+  // launchMacaKVTiled 负责共享 K/V 的高复用路径，launchMacaFallback 负责通用形状。
+  if (use_kv_tiled) {
+    launchMacaKVTiled(d_q, d_k, d_v, d_o, params);
+  } else {
+    launchMacaFallback(d_q, d_k, d_v, d_o, params);
+  }
+
+  RUNTIME_CHECK(mcGetLastError());
+
+  // 默认流中的阻塞 D2H 拷贝会等待 Kernel 完成。
+  RUNTIME_CHECK(
+      mcMemcpy(h_o.data(), d_o, q_elems * sizeof(T), mcMemcpyDeviceToHost));
 }
 
 // *********************************************************************

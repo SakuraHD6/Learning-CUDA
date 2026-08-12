@@ -144,3 +144,16 @@ make PLATFORM=moore
 ## 有疑问？
 
 可以在群里直接询问助教。
+
+- NVCC 配置(ai.gitee租卡)
+
+```
+临时生效（当前终端）：
+export PATH=/usr/local/cuda/bin:$PATH
+SKIP_ATTENTION=1 make
+
+永久生效（推荐）：
+echo 'export PATH=/usr/local/cuda/bin:$PATH' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+```
